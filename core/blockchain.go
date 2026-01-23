@@ -708,6 +708,17 @@ func (bc *BlockChain) ProcessBlock(block *types.Block, parent *types.Header, wit
 		return nil, nil, 0, nil, 0, err
 	}
 
+	// Begin upgradable transaction for TrieDB mode.
+	// The transaction will be committed in writeBlockWithState on success,
+	// or rolled back on error.
+	// Note: In TDB mode, we only use the serial processor because the parallel
+	// processor (Block STM) hasn't been integrated with the upgradable transaction model.
+	if bc.triedb.IsUsingTDB() {
+		if err := statedb.BeginTrieDBTransaction(); err != nil {
+			return nil, nil, 0, nil, 0, fmt.Errorf("failed to begin TrieDB transaction: %w", err)
+		}
+	}
+
 	// Upload the statistics of reader at the end
 	defer func() {
 		stats := prefetch.GetStats()
@@ -759,11 +770,17 @@ func (bc *BlockChain) ProcessBlock(block *types.Block, parent *types.Header, wit
 		log.Debug("Processing block using Block STM only", "number", block.NumberU64())
 		resultChanLen = 1
 	}
+	// Disable parallel processing in TDB mode - the parallel processor (Block STM)
+	// hasn't been integrated with the upgradable transaction model yet
+	usingTDB := bc.triedb.IsUsingTDB()
+	if usingTDB {
+		resultChanLen = 1
+	}
 	resultChan := make(chan Result, resultChanLen)
 
 	processorCount := 0
 
-	if bc.parallelProcessor != nil {
+	if bc.parallelProcessor != nil && !usingTDB {
 		processorCount++
 
 		go func() {
@@ -783,7 +800,8 @@ func (bc *BlockChain) ProcessBlock(block *types.Block, parent *types.Header, wit
 		}()
 	}
 
-	if bc.processor != nil && !bc.enforceParallelProcessor {
+	// In TDB mode, always use serial processor (usingTDB overrides enforceParallelProcessor)
+	if bc.processor != nil && (!bc.enforceParallelProcessor || usingTDB) {
 		processorCount++
 
 		go func() {
@@ -3185,6 +3203,10 @@ func (bc *BlockChain) insertChainWithWitnesses(chain types.Blocks, setHead bool,
 		if err != nil {
 			bc.reportBlock(block, &ProcessResult{Receipts: receipts}, err)
 			followupInterrupt.Store(true)
+			// Rollback TrieDB transaction on error
+			if statedb != nil {
+				statedb.RollbackTrieDBTransaction()
+			}
 			return nil, it.index, err
 		}
 
@@ -3229,10 +3251,12 @@ func (bc *BlockChain) insertChainWithWitnesses(chain types.Blocks, setHead bool,
 		// so that it's considered as a `past` chain and the validation doesn't get bypassed.
 		isValid, err = bc.forker.ValidateReorg(block.Header(), []*types.Header{block.Header()})
 		if err != nil {
+			statedb.RollbackTrieDBTransaction()
 			return nil, it.index, err
 		}
 
 		if !isValid {
+			statedb.RollbackTrieDBTransaction()
 			return nil, it.index, whitelist.ErrMismatch
 		}
 
@@ -3246,6 +3270,10 @@ func (bc *BlockChain) insertChainWithWitnesses(chain types.Blocks, setHead bool,
 		followupInterrupt.Store(true)
 
 		if err != nil {
+			// Note: writeBlockWithState may have already committed the transaction on success,
+			// but if it failed before commit, we need to rollback. The rollback is safe
+			// even if the transaction was already committed/rolled back.
+			statedb.RollbackTrieDBTransaction()
 			return nil, it.index, err
 		}
 

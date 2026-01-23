@@ -12,16 +12,16 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/holiman/uint256"
 )
 
 // Re-export types and functions from triedb package
 type (
-	Database      = triedb.Database
-	TransactionRO = triedb.TransactionRO
-	TransactionRW = triedb.TransactionRW
-	Address       = triedb.Address
-	Hash          = triedb.Hash
+	Database              = triedb.Database
+	TransactionRO         = triedb.TransactionRO
+	TransactionRW         = triedb.TransactionRW
+	TransactionUpgradable = triedb.TransactionUpgradable
+	Address               = triedb.Address
+	Hash                  = triedb.Hash
 )
 
 // Re-export functions
@@ -101,8 +101,7 @@ func SetStateAccount(tx *TransactionRW, address Address, account *types.StateAcc
 
 // TrieDB implements the Trie interface using triedb-go with overlay state
 type TrieDB struct {
-	db   *Database
-	root common.Hash
+	db *Database
 
 	// Local cache of uncommitted changes (new changes since last commit)
 	accounts map[Address]*types.StateAccount // nil means deleted
@@ -112,8 +111,11 @@ type TrieDB struct {
 	committedAccounts map[Address]*types.StateAccount
 	committedStorage  map[Address]map[Hash][]byte
 
-	// Last computed root (for optimization when no new changes)
-	lastComputedRoot common.Hash
+	// Current state root (updated after ComputeRoot is called)
+	root common.Hash
+
+	// Upgradable transaction for single root computation with deferred commit
+	upgradableTx *TransactionUpgradable
 }
 
 // NewTrieDB creates a new Trie implementation using triedb-go
@@ -133,7 +135,6 @@ func NewTrieDB(root common.Hash, db *Database) (*TrieDB, error) {
 		storage:           make(map[Address]map[Hash][]byte),
 		committedAccounts: make(map[Address]*types.StateAccount),
 		committedStorage:  make(map[Address]map[Hash][]byte),
-		lastComputedRoot:  root,
 	}, nil
 }
 
@@ -206,8 +207,24 @@ func (t *TrieDB) Copy() *TrieDB {
 		storage:           storage,
 		committedAccounts: committedAccounts,
 		committedStorage:  committedStorage,
-		lastComputedRoot:  t.lastComputedRoot,
+		upgradableTx:      t.upgradableTx, // Share the same upgradable transaction
 	}
+}
+
+// SetUpgradableTransaction sets the upgradable transaction for this TrieDB
+func (t *TrieDB) SetUpgradableTransaction(tx *TransactionUpgradable) {
+	t.upgradableTx = tx
+}
+
+// SetRoot sets the root hash. This is used when a TrieDB instance is created
+// after another instance has already computed the root on the shared upgradable transaction.
+func (t *TrieDB) SetRoot(root common.Hash) {
+	t.root = root
+}
+
+// GetUpgradableTransaction returns the upgradable transaction for this TrieDB
+func (t *TrieDB) GetUpgradableTransaction() *TransactionUpgradable {
+	return t.upgradableTx
 }
 
 // GetKey returns the sha3 preimage of a hashed key
@@ -386,66 +403,17 @@ func (t *TrieDB) UpdateContractCode(address common.Address, codeHash common.Hash
 	return nil
 }
 
-// buildOverlay creates an overlay state from the committed changes buffer
-func (t *TrieDB) buildOverlay() (*triedb.OverlayState, error) {
-	overlay, err := triedb.NewOverlayState()
-	if err != nil {
-		return nil, err
-	}
-
-	// Insert all account changes from committed buffer
-	for addr, acc := range t.committedAccounts {
-		if err := overlay.InsertAccount(addr, FromStateAccount(acc)); err != nil {
-			overlay.Close()
-			return nil, err
-		}
-	}
-
-	// Insert all storage changes from committed buffer
-	for addr, slots := range t.committedStorage {
-		for slot, value := range slots {
-			if len(value) == 0 {
-				// Deletion
-				if err := overlay.InsertStorage(addr, slot, nil); err != nil {
-					overlay.Close()
-					return nil, err
-				}
-			} else {
-				// Update - convert value to uint256.Int
-				var valBytes [32]byte
-				if len(value) > 32 {
-					overlay.Close()
-					return nil, fmt.Errorf("storage value too large: %d bytes", len(value))
-				}
-				copy(valBytes[32-len(value):], value)
-				valInt := new(uint256.Int)
-				valInt.SetBytes(valBytes[:])
-
-				if err := overlay.InsertStorage(addr, slot, valInt); err != nil {
-					overlay.Close()
-					return nil, err
-				}
-			}
-		}
-	}
-
-	return overlay, nil
-}
-
 // Hash returns the root hash of the trie
 func (t *TrieDB) Hash() common.Hash {
 	h, _ := t.Commit(false)
 	return h
 }
 
-// Commit computes the new state root by applying the overlay changes
-// Note: This does NOT persist changes to the database, it only computes the new root
+// Commit accumulates state changes for later root computation.
+// In TrieDB mode, changes are accumulated locally and only pushed to the
+// upgradable transaction when FinalizeRoot() is called.
+// The caller is responsible for calling Commit() or Rollback() on the transaction.
 func (t *TrieDB) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
-	// Optimization: if no new changes since last commit, return cached root
-	if len(t.accounts) == 0 && len(t.storage) == 0 {
-		return t.lastComputedRoot, nil
-	}
-
 	// Merge uncommitted changes into committed buffers
 	for addr, acc := range t.accounts {
 		t.committedAccounts[addr] = acc
@@ -463,31 +431,76 @@ func (t *TrieDB) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	t.accounts = make(map[Address]*types.StateAccount)
 	t.storage = make(map[Address]map[Hash][]byte)
 
-	// Build overlay from committed buffers
-	overlay, err := t.buildOverlay()
-	if err != nil {
-		log.Error("Failed to build overlay", "err", err)
-		return t.root, nil
-	}
-	defer overlay.Close()
-
-	tx, err := t.db.BeginRO()
-	if err != nil {
-		log.Error("Failed to begin read-only transaction", "err", err)
-		return t.root, nil
-	}
-	defer tx.Commit()
-
-	root, err := tx.ComputeRootWithOverlay(overlay)
-	if err != nil {
-		log.Error("Failed to compute root with overlay", "err", err)
-		return t.root, nil
+	// If upgradable transaction is set, push changes to it
+	if t.upgradableTx != nil {
+		return t.commitWithUpgradableTx()
 	}
 
-	// Cache the computed root for future calls with no changes
-	t.lastComputedRoot = common.Hash(root)
+	return t.root, nil
+}
 
-	return t.lastComputedRoot, nil
+// commitWithUpgradableTx pushes changes to the upgradable transaction.
+// This only pushes SetAccount/SetStorage calls - it does NOT call ComputeRoot().
+// ComputeRoot() is called once from FinalizeRoot() at the StateDB level.
+func (t *TrieDB) commitWithUpgradableTx() (common.Hash, *trienode.NodeSet) {
+	log.Debug("commitWithUpgradableTx: pushing changes to upgradable transaction",
+		"accounts", len(t.committedAccounts), "storage_addrs", len(t.committedStorage),
+		"tx", fmt.Sprintf("%p", t.upgradableTx))
+
+	// Push all committed changes to the upgradable transaction
+	for addr, acc := range t.committedAccounts {
+		if err := t.upgradableTx.SetAccount(addr, FromStateAccount(acc)); err != nil {
+			log.Error("Failed to set account in upgradable transaction", "addr", common.Address(addr), "err", err)
+			return t.root, nil
+		}
+	}
+
+	for addr, slots := range t.committedStorage {
+		for slot, value := range slots {
+			var storageValue *Hash
+			if len(value) > 0 {
+				var h Hash
+				if len(value) <= 32 {
+					copy(h[32-len(value):], value)
+				} else {
+					log.Error("Storage value too large", "addr", addr, "slot", slot, "len", len(value))
+					return t.root, nil
+				}
+				storageValue = &h
+			}
+			if err := t.upgradableTx.SetStorage(addr, slot, storageValue); err != nil {
+				log.Error("Failed to set storage in upgradable transaction", "addr", addr, "slot", slot, "err", err)
+				return t.root, nil
+			}
+		}
+	}
+
+	// Clear the committed buffers after pushing
+	t.committedAccounts = make(map[Address]*types.StateAccount)
+	t.committedStorage = make(map[Address]map[Hash][]byte)
+
+	// Return the last computed root (or initial root if not yet computed).
+	// The actual ComputeRoot() call happens in FinalizeRoot().
+	return t.root, nil
+}
+
+// FinalizeRoot computes the state root for the upgradable transaction.
+// This is the ONLY place that calls ComputeRoot() on the transaction.
+// It should be called once after all tries have pushed their changes via Commit().
+// The caller (StateDB) ensures this is only called once via s.rootFinalized guard.
+func (t *TrieDB) FinalizeRoot() (common.Hash, error) {
+	if t.upgradableTx == nil {
+		return t.root, nil
+	}
+
+	root, err := t.upgradableTx.ComputeRoot()
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("failed to compute root: %w", err)
+	}
+
+	t.root = common.Hash(root)
+
+	return t.root, nil
 }
 
 // Witness returns the set of accessed trie nodes

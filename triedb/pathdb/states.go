@@ -26,13 +26,10 @@ import (
 	"github.com/VictoriaMetrics/fastcache"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
-
-	"github.com/cffls/triedb-go/triedb-go"
 )
 
 // counter helps in tracking items and their corresponding sizes.
@@ -447,79 +444,16 @@ func (s *stateSet) write(batch ethdb.Batch, genMarker []byte, clean *fastcache.C
 }
 
 func (s *stateSet) writeTrieDB(db ethdb.Database) error {
-	tdb := db.TrieDB()
-	if tdb == nil {
-		return nil
-	}
-
-	tx, err := tdb.BeginRW()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for addrHash, blob := range s.accountData {
-		addr, ok := s.addressMap[addrHash]
-		if !ok {
-			return fmt.Errorf("address map not found for account %x", addrHash)
-		}
-
-		if len(blob) == 0 {
-			if err := tx.SetAccount(triedb.Address(addr), nil); err != nil {
-				return err
-			}
-		} else {
-			account := new(types.SlimAccount)
-			if err := rlp.DecodeBytes(blob, account); err != nil {
-				return fmt.Errorf("failed to decode account %x (blob len=%d, blob=%x): %w", addrHash, len(blob), blob, err)
-			}
-
-			if len(account.CodeHash) == 0 {
-				account.CodeHash = types.EmptyCodeHash.Bytes()
-			}
-
-			if err := tx.SetAccount(triedb.Address(addr), &triedb.Account{
-				Nonce:    account.Nonce,
-				Balance:  account.Balance,
-				CodeHash: account.CodeHash,
-			}); err != nil {
-				return err
-			}
-		}
-	}
-	for addrHash, slots := range s.storageData {
-		addr, ok := s.addressMap[addrHash]
-		if !ok {
-			return fmt.Errorf("address map not found for storage %x", addrHash)
-		}
-		for storageHash, blob := range slots {
-			storageKey, ok := s.storageKeyMap[storageHash]
-			if !ok {
-				return fmt.Errorf("storage key map not found for storage %x", storageHash)
-			}
-
-			// Empty blob means storage slot was deleted
-			if len(blob) == 0 {
-				if err := tx.SetStorage(triedb.Address(addr), triedb.Hash(storageKey), nil); err != nil {
-					return err
-				}
-				continue
-			}
-
-			_, content, _, err := rlp.Split(blob)
-			if err != nil {
-				return fmt.Errorf("failed to split storage %x for account %x (blob len=%d, blob=%x): %w", storageHash, addrHash, len(blob), blob, err)
-			}
-			var slot common.Hash
-			slot.SetBytes(content)
-
-			var value triedb.Hash
-			copy(value[:], slot[:])
-			if err := tx.SetStorage(triedb.Address(addr), triedb.Hash(storageKey), &value); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
+	// TrieDB persistence is now handled via CommitTrieDBTransaction() in writeBlockWithState.
+	// This method was previously doing redundant writes using BeginRW().
+	// With the upgradable transaction approach:
+	// 1. Root computation and persistence happen together via TransactionUpgradable
+	// 2. CommitTrieDBTransaction() is called after successful state commit
+	// 3. This method is no longer needed for TrieDB persistence
+	//
+	// We return nil to maintain backward compatibility with the flush() call site.
+	// The actual persistence is handled by the upgradable transaction lifecycle.
+	return nil
 }
 
 // reset clears all cached state data, including any optional sorted lists that

@@ -189,6 +189,11 @@ func flushAlloc(ga *types.GenesisAlloc, triedb *triedb.Database) (common.Hash, e
 		return common.Hash{}, err
 	}
 
+	// Begin upgradable transaction for TDB mode
+	if err := statedb.BeginTrieDBTransaction(); err != nil {
+		return common.Hash{}, fmt.Errorf("failed to begin TrieDB transaction: %w", err)
+	}
+
 	for addr, account := range *ga {
 		if account.Balance != nil {
 			// This is not actually logged via tracer because OnGenesisBlock
@@ -203,8 +208,16 @@ func flushAlloc(ga *types.GenesisAlloc, triedb *triedb.Database) (common.Hash, e
 	}
 	root, err := statedb.Commit(0, false, false)
 	if err != nil {
+		// Rollback the TrieDB transaction on error
+		statedb.RollbackTrieDBTransaction()
 		return common.Hash{}, err
 	}
+
+	// Commit the TrieDB transaction to persist changes (TDB mode)
+	if err := statedb.CommitTrieDBTransaction(); err != nil {
+		return common.Hash{}, fmt.Errorf("failed to commit TrieDB transaction: %w", err)
+	}
+
 	// Commit newly generated states into disk if it's not empty.
 	if root != types.EmptyRootHash {
 		if err := triedb.Commit(root, true); err != nil {

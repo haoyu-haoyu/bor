@@ -171,6 +171,14 @@ type StateDB struct {
 
 	// Bor metrics
 	BorConsensusTime time.Duration
+
+	// Upgradable transaction for TrieDB mode - allows single root computation with deferred commit
+	upgradableTx *trie.TransactionUpgradable
+
+	// finalizedRoot is the state root after ComputeRoot() has been called on the upgradable transaction.
+	// This is used to ensure all subsequent Commit() calls return the same root.
+	finalizedRoot common.Hash
+	rootFinalized bool
 }
 
 // New creates a new state from a given trie.
@@ -1272,6 +1280,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			return common.Hash{}
 		}
 		s.trie = tr
+		// Inject the upgradable transaction if available (for TrieDB mode)
+		s.injectTrieDBTransaction()
 	}
 	// If there was a trie prefetcher operating, terminate it async so that the
 	// individual storage tries can be updated as soon as the disk load finishes.
@@ -1409,6 +1419,49 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	}
 	// Track the amount of time wasted on hashing the account trie
 	defer func(start time.Time) { s.AccountHashes += time.Since(start) }(time.Now())
+
+	// For TrieDB mode: if root was already finalized (e.g., by a previous call or a copied StateDB),
+	// check if there are pending mutations that won't be included in the cached root.
+	if s.rootFinalized && s.db.TrieDB().IsUsingTDB() {
+		// Check if there are mutations that haven't been applied yet
+		pendingMutations := 0
+		for _, op := range s.mutations {
+			if !op.applied {
+				pendingMutations++
+			}
+		}
+		if pendingMutations > 0 {
+			log.Warn("IntermediateRoot: root already finalized but there are pending mutations!",
+				"root", s.finalizedRoot, "pendingMutations", pendingMutations)
+			// These mutations will NOT be included in the state root!
+			// This is a bug - all mutations should be made before the first IntermediateRoot call.
+		}
+		log.Debug("IntermediateRoot: returning cached finalized root", "root", s.finalizedRoot, "pendingMutations", pendingMutations)
+		return s.finalizedRoot
+	}
+
+	// For TrieDB mode: first commit the account trie to push changes to the transaction,
+	// then call FinalizeRoot() to compute the state root.
+	// This is the ONLY place ComputeRoot() is called - all prior Commit() calls
+	// just pushed changes (SetAccount/SetStorage) without computing the root.
+	if s.db.TrieDB().IsUsingTDB() {
+		if trieDB, ok := s.trie.(*trie.TrieDB); ok {
+			// Push account trie changes to the transaction
+			trieDB.Commit(false)
+
+			// Now compute the root
+			root, err := trieDB.FinalizeRoot()
+			if err != nil {
+				log.Error("IntermediateRoot: failed to finalize root", "err", err)
+				s.setError(err)
+				return common.Hash{}
+			}
+			log.Debug("IntermediateRoot: finalized root", "root", root)
+			s.finalizedRoot = root
+			s.rootFinalized = true
+			return root
+		}
+	}
 
 	hash := s.trie.Hash()
 
@@ -1831,6 +1884,13 @@ func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool, noStorageWiping 
 	if err != nil {
 		return common.Hash{}, err
 	}
+
+	if s.db.TrieDB().IsUsingTDB() {
+		if err := s.CommitTrieDBTransaction(); err != nil {
+			return common.Hash{}, fmt.Errorf("failed to commit TrieDB transaction: %w", err)
+		}
+	}
+
 	return ret.root, nil
 }
 
@@ -1984,4 +2044,97 @@ func (s *StateDB) AccessEvents() *AccessEvents {
 // Inner receives the underlying state db
 func (s *StateDB) Inner() *StateDB {
 	return s
+}
+
+// BeginTrieDBTransaction begins an upgradable transaction for TrieDB mode.
+// This must be called before any state modifications if using TrieDB.
+// The transaction accumulates changes in memory until ComputeRoot() is called,
+// then can be committed or rolled back.
+func (s *StateDB) BeginTrieDBTransaction() error {
+	if !s.db.TrieDB().IsUsingTDB() {
+		return nil
+	}
+
+	tdb := s.db.TrieDB().Disk().TrieDB()
+	if tdb == nil {
+		return errors.New("TrieDB is nil")
+	}
+
+	tx, err := tdb.BeginUpgradable()
+	if err != nil {
+		return fmt.Errorf("failed to begin upgradable transaction: %w", err)
+	}
+
+	s.upgradableTx = tx
+	return nil
+}
+
+// CommitTrieDBTransaction commits the upgradable transaction, persisting all changes.
+// Must be called after IntermediateRoot() or Commit() to persist changes.
+func (s *StateDB) CommitTrieDBTransaction() error {
+	if s.upgradableTx == nil {
+		log.Debug("CommitTrieDBTransaction: no transaction to commit")
+		return nil
+	}
+
+	if !s.rootFinalized && s.trie != nil {
+		if trieDB, ok := s.trie.(*trie.TrieDB); ok {
+			log.Debug("CommitTrieDBTransaction: computing root")
+			root, err := trieDB.FinalizeRoot()
+			if err != nil {
+				log.Error("CommitTrieDBTransaction: failed to compute root", "err", err)
+				return fmt.Errorf("failed to compute root: %w", err)
+			}
+			s.finalizedRoot = root
+			s.rootFinalized = true
+			log.Debug("CommitTrieDBTransaction: root computed", "root", root)
+		}
+	}
+
+	log.Debug("CommitTrieDBTransaction: committing transaction", "tx", fmt.Sprintf("%p", s.upgradableTx))
+
+	err := s.upgradableTx.Commit()
+	s.upgradableTx = nil
+	if err != nil {
+		log.Error("CommitTrieDBTransaction: commit failed", "err", err)
+		return fmt.Errorf("failed to commit upgradable transaction: %w", err)
+	}
+
+	log.Debug("CommitTrieDBTransaction: commit successful")
+	return nil
+}
+
+// RollbackTrieDBTransaction rolls back the upgradable transaction, discarding all changes.
+// Can be called at any time to discard pending changes.
+func (s *StateDB) RollbackTrieDBTransaction() error {
+	if s.upgradableTx == nil {
+		return nil
+	}
+
+	err := s.upgradableTx.Rollback()
+	s.upgradableTx = nil
+	if err != nil {
+		return fmt.Errorf("failed to rollback upgradable transaction: %w", err)
+	}
+
+	return nil
+}
+
+// injectTrieDBTransaction injects the upgradable transaction into the trie if it's a TrieDB.
+func (s *StateDB) injectTrieDBTransaction() {
+	log.Debug("injectTrieDBTransaction called", "upgradableTx", fmt.Sprintf("%p", s.upgradableTx), "trie", fmt.Sprintf("%p", s.trie), "rootFinalized", s.rootFinalized)
+	if s.upgradableTx == nil || s.trie == nil {
+		log.Debug("injectTrieDBTransaction: early return", "hasTx", s.upgradableTx != nil, "hasTrie", s.trie != nil)
+		return
+	}
+
+	if trieDB, ok := s.trie.(*trie.TrieDB); ok {
+		log.Debug("injectTrieDBTransaction: injecting transaction into TrieDB", "trieDB", fmt.Sprintf("%p", trieDB), "tx", fmt.Sprintf("%p", s.upgradableTx), "rootFinalized", s.rootFinalized)
+		trieDB.SetUpgradableTransaction(s.upgradableTx)
+		if s.rootFinalized {
+			trieDB.SetRoot(s.finalizedRoot)
+		}
+	} else {
+		log.Warn("injectTrieDBTransaction: trie is not *trie.TrieDB, cannot inject transaction", "trieType", fmt.Sprintf("%T", s.trie))
+	}
 }
