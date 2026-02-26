@@ -28,7 +28,6 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
@@ -300,6 +299,7 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 		// memory allowance for cache.
 		Cache:        pebble.NewCache(int64(cache * 1024 * 1024)),
 		MaxOpenFiles: handles,
+		BytesPerSync: 1 * 1024 * 1024,
 
 		// The size of memory table(as well as the write buffer).
 		// Note, there may have more than two memory tables in the system.
@@ -310,7 +310,7 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 		// Note, this must be the number of tables not the size of all memtables
 		// according to https://github.com/cockroachdb/pebble/blob/master/options.go#L738-L742
 		// and to https://github.com/cockroachdb/pebble/blob/master/db.go#L1892-L1903.
-		MemTableStopWritesThreshold: memTableLimit,
+		MemTableStopWritesThreshold: memTableLimit * 2,
 
 		// The default compaction concurrency(1 thread),
 		// Here use all available CPUs for faster compaction.
@@ -319,13 +319,13 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 		// Per-level options. Options for at least one level must be specified. The
 		// options for the last level are used for all subsequent levels.
 		Levels: []pebble.LevelOptions{
-			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
-			{TargetFileSize: 4 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10), Compression: pebble.NoCompression},
+			{TargetFileSize: 4 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10), Compression: pebble.NoCompression},
 			{TargetFileSize: 8 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
 			{TargetFileSize: 16 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
-			{TargetFileSize: 32 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
-			{TargetFileSize: 64 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
-			{TargetFileSize: 128 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 32 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10), BlockSize: 32*1024},
+			{TargetFileSize: 64 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10), BlockSize: 32 * 1024, Compression: pebble.ZstdCompression},
+			{TargetFileSize: 128 * 1024 * 1024, BlockSize: 32 * 1024, Compression: pebble.ZstdCompression},
 		},
 		ReadOnly: readonly,
 		EventListener: &pebble.EventListener{
@@ -363,6 +363,8 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 	// Disable seek compaction explicitly. Check https://github.com/ethereum/go-ethereum/pull/20130
 	// for more details.
 	opt.Experimental.ReadSamplingMultiplier = -1
+	opt.Experimental.L0CompactionConcurrency = 1      // +1 compaction worker per overlapping sublevel
+	opt.Experimental.CompactionDebtConcurrency = 1 << 28  // +1 worker per 256 MB of compaction debt
 
 	// Open the db and recover any potential corruptions
 	innerDB, err := pebble.Open(file, opt)
