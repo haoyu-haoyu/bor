@@ -151,13 +151,13 @@ syncmode = "full"
     # [telemetry.influx.tags]
 
 [cache]
-    # the following changes are made considering the node pos-mainnet-london-sentry-04
-    cache = 24576              # A: was 8192 (3×)
-    gc = 25                    # H: was 0 — re-enable dirty trie cache (async flush prevents old stall issue)
-    gomemlimit = "100GB"       # A: prevent Go from using all remaining RAM for GC
-    snapshot = 20              # keep as-is
-    database = 40              # keep as-is
-    trie = 15                  # was 40 — reduced because gc=25 now handles dirty trie data
+    # the following changes are made considering the node pos-mainnet-london-sentry-04 (125 GB RAM)
+    cache = 49152              # 48 GB (was 8 GB, hence 6c). Estimated RSS ~89 GB, leaves ~36 GB for OS/page cache
+    gc = 5                     # Was 0 initially, then 25 (wasted 4 GB above the cap). Setting it to 5 so we have 2.4 GB, just above the 2 GB maxBufferSize cap.
+    gomemlimit = "100GB"       # runtime memory limit for GC (fixed: now uses debug.SetMemoryLimit instead of os.Setenv)
+    snapshot = 25              # 12 GB (was 20% of 24 GB = 4.8 GB)
+    database = 45              # 21.6 GB (was 40% of 24 GB = 9.6 GB)
+    trie = 25                  # 12 GB (was 15% of 24 GB = 3.6 GB)
     # noprefetch = false
     # preimages = false
     # txlookuplimit = 2350000

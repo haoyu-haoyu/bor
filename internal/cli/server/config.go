@@ -4,11 +4,10 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 
-	// "math"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1508,11 +1507,11 @@ func (c *Config) buildEth(stack *node.Node, accountManager *accounts.Manager) (*
 		}
 		// Apply configurable garbage collection settings with validation
 		if c.Cache.GoMemLimit != "" {
-			if err := validateGoMemLimit(c.Cache.GoMemLimit); err != nil {
+			if bytes, err := parseGoMemLimit(c.Cache.GoMemLimit); err != nil {
 				log.Warn("Invalid GOMEMLIMIT value, skipping", "value", c.Cache.GoMemLimit, "error", err)
 			} else {
-				os.Setenv("GOMEMLIMIT", c.Cache.GoMemLimit)
-				log.Info("Set GOMEMLIMIT", "value", c.Cache.GoMemLimit)
+				prev := godebug.SetMemoryLimit(bytes)
+				log.Info("Set GOMEMLIMIT via runtime", "value", c.Cache.GoMemLimit, "bytes", bytes, "previous", prev)
 			}
 		}
 
@@ -2133,21 +2132,49 @@ func MakePasswordListFromFile(path string) ([]string, error) {
 	return lines, nil
 }
 
-// validateGoMemLimit validates GOMEMLIMIT values
-func validateGoMemLimit(value string) error {
-	// GOMEMLIMIT can be:
-	// - A number followed by optional unit (B, KB, MB, GB, TB, PB)
-	// - "off" to disable soft limit
+// parseGoMemLimit parses a GOMEMLIMIT string (e.g. "100GB", "1024MB", "off")
+// into bytes. Returns math.MaxInt64 for "off" (no limit).
+func parseGoMemLimit(value string) (int64, error) {
 	if value == "off" {
-		return nil
+		return math.MaxInt64, nil
 	}
 
-	// Parse the value to validate format
-	if matched, _ := regexp.MatchString(`^[0-9]+(\.[0-9]+)?[KMGTPE]?[iB]?$`, value); !matched {
-		return fmt.Errorf("invalid GOMEMLIMIT format, expected number with optional unit (e.g., '8GB', '1024MB')")
+	// Split numeric prefix from unit suffix
+	i := 0
+	for i < len(value) && (value[i] >= '0' && value[i] <= '9' || value[i] == '.') {
+		i++
 	}
 
-	return nil
+	if i == 0 {
+		return 0, fmt.Errorf("invalid GOMEMLIMIT: no numeric value in %q", value)
+	}
+
+	numStr := value[:i]
+	unit := value[i:]
+
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid GOMEMLIMIT number %q: %v", numStr, err)
+	}
+
+	var multiplier float64
+
+	switch unit {
+	case "", "B":
+		multiplier = 1
+	case "KB", "KiB":
+		multiplier = 1024
+	case "MB", "MiB":
+		multiplier = 1024 * 1024
+	case "GB", "GiB":
+		multiplier = 1024 * 1024 * 1024
+	case "TB", "TiB":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("invalid GOMEMLIMIT unit %q (expected B, KB, MB, GB, TB)", unit)
+	}
+
+	return int64(num * multiplier), nil
 }
 
 // sanitizeGoGC clamps GOGC values to reasonable bounds
