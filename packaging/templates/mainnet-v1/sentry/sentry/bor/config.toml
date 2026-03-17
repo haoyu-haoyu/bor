@@ -152,12 +152,12 @@ syncmode = "full"
 
 [cache]
     # the following changes are made considering the node pos-mainnet-london-sentry-04 (125 GB RAM)
-    cache = 49152              # 48 GB (was 8 GB, hence 6c). Estimated RSS ~89 GB, leaves ~36 GB for OS/page cache
-    gc = 5                     # Was 0 initially, then 25 (wasted 4 GB above the cap). Setting it to 5 so we have 2.4 GB, just above the 2 GB maxBufferSize cap.
-    gomemlimit = "100GB"       # runtime memory limit for GC (fixed: now uses debug.SetMemoryLimit instead of os.Setenv)
-    snapshot = 25              # 12 GB (was 20% of 24 GB = 4.8 GB)
-    database = 45              # 21.6 GB (was 40% of 24 GB = 9.6 GB)
-    trie = 25                  # 12 GB (was 15% of 24 GB = 3.6 GB)
+    cache = 36864              # 36 GB (was 48 GB — caused OOM). Estimated RSS ~77 GB, leaves ~48 GB for OS/page cache
+    gc = 5                     # 1.8 GB — just below 2 GB maxBufferSize cap, but sanitize() clamps to it
+    gomemlimit = "80GB"        # was 100 GB — too lazy, GC let heap grow. 80 GB forces earlier collection
+    snapshot = 25              # 9 GB
+    database = 45              # 16.2 GB
+    trie = 25                  # 9 GB
     # noprefetch = false
     # preimages = false
     # txlookuplimit = 2350000
