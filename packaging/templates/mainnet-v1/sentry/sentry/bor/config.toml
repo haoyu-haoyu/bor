@@ -152,12 +152,12 @@ syncmode = "full"
 
 [cache]
     # the following changes are made considering the node pos-mainnet-london-sentry-04 (125 GB RAM)
-    cache = 36864              # 36 GB (was 48 GB — caused OOM). Estimated RSS ~77 GB, leaves ~48 GB for OS/page cache
-    gc = 5                     # 1.8 GB — just below 2 GB maxBufferSize cap, but sanitize() clamps to it
-    gomemlimit = "80GB"        # was 100 GB — too lazy, GC let heap grow. 80 GB forces earlier collection
-    snapshot = 25              # 9 GB
-    database = 45              # 16.2 GB
-    trie = 25                  # 9 GB
+    cache = 24576              # 24 GB — reverted to stable baseline (36 GB and 48 GB both caused memory alerts/OOMs)
+    gc = 5                     # 1.2 GB — usable with 2 GB maxBufferSize cap (sanitize() clamps up)
+    gomemlimit = "80GB"        # runtime memory limit for GC (fixed: now uses debug.SetMemoryLimit)
+    snapshot = 25              # 6 GB
+    database = 45              # 10.8 GB
+    trie = 25                  # 6 GB
     # noprefetch = false
     # preimages = false
     # txlookuplimit = 2350000
